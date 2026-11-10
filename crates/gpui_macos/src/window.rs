@@ -648,6 +648,8 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// Pauses the display link while the window is idle.
+    idle_frames: Rc<IdleFrames>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -816,6 +818,8 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        self.idle_frames.paused.set(false);
+        self.idle_frames.idle_streak.set(0);
         if !self
             .native_window()
             .occlusionState()
@@ -838,6 +842,24 @@ impl MacWindowState {
     fn stop_display_link(&mut self) {
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
+        }
+    }
+
+    /// Stops the display link of a window that needs no frames. It starts again
+    /// when GPUI next wants a frame ([`IdleFrames::wake`]).
+    fn pause_display_link(&mut self) {
+        self.stop_display_link();
+        self.idle_frames.paused.set(true);
+    }
+
+    fn resume_display_link(&mut self) {
+        self.idle_frames.resume_queued.set(false);
+        if self.idle_frames.paused.get() {
+            self.start_display_link();
+            // The frame that woke the link shouldn't wait for the next vblank.
+            if let Some(frame_source) = &self.frame_source {
+                frame_source.request_frame_now();
+            }
         }
     }
 
@@ -933,7 +955,85 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>, MainThreadMarker);
+/// Pauses a window's display link while GPUI wants no frames, so an idle window
+/// isn't woken on every vblank.
+///
+/// After a few display-link frames in a row in which GPUI neither drew nor
+/// presented, nor asked for another frame, the link stops (a few rather than one,
+/// so typing or moving the pointer doesn't stop and start it every other frame).
+/// GPUI's frame waker and `schedule_frame`, which it calls whenever the window
+/// becomes dirty, a next-frame callback is queued, or a throttled frame is retried,
+/// start it again, and the first frame is requested at once rather than at the next
+/// vblank. Main thread only.
+struct IdleFrames {
+    /// Display-link frames in a row with nothing to do.
+    idle_streak: Cell<u32>,
+    /// GPUI asked for a frame since the current display-link frame began.
+    demanded: Cell<bool>,
+    /// The window drew or presented since the current display-link frame began.
+    drew: Cell<bool>,
+    /// The display link is stopped because the window was idle.
+    paused: Cell<bool>,
+    /// A task to resume the link is queued (the window state was locked when the
+    /// demand came).
+    resume_queued: Cell<bool>,
+    foreground_executor: ForegroundExecutor,
+}
+
+impl IdleFrames {
+    /// Idle display-link frames in a row before the link stops.
+    const PAUSE_AFTER: u32 = 8;
+
+    /// Records a display-link frame; whether the link should stop now.
+    fn frame_was_idle(&self) -> bool {
+        if self.demanded.get() || self.drew.get() {
+            self.idle_streak.set(0);
+            return false;
+        }
+        let streak = self.idle_streak.get() + 1;
+        self.idle_streak.set(streak);
+        streak >= Self::PAUSE_AFTER
+    }
+
+    fn new(foreground_executor: ForegroundExecutor) -> Self {
+        Self {
+            idle_streak: Cell::new(0),
+            demanded: Cell::new(false),
+            drew: Cell::new(false),
+            paused: Cell::new(false),
+            resume_queued: Cell::new(false),
+            foreground_executor,
+        }
+    }
+
+    /// GPUI wants a frame: restart a paused display link.
+    fn wake(&self, window_state: &Weak<Mutex<MacWindowState>>) {
+        self.demanded.set(true);
+        if !self.paused.get() || self.resume_queued.get() {
+            return;
+        }
+        let Some(state) = window_state.upgrade() else {
+            return;
+        };
+        // GPUI can ask from inside a call that holds the window state; resume
+        // after it, then.
+        if let Some(mut lock) = state.try_lock() {
+            lock.resume_display_link();
+            return;
+        }
+        self.resume_queued.set(true);
+        let window_state = window_state.clone();
+        self.foreground_executor
+            .spawn(async move {
+                if let Some(state) = window_state.upgrade() {
+                    state.lock().resume_display_link();
+                }
+            })
+            .detach();
+    }
+}
+
+pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>, MainThreadMarker, Rc<IdleFrames>);
 
 impl MacWindow {
     pub fn open(
@@ -1062,6 +1162,7 @@ impl MacWindow {
             let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
             assert!(!native_view.is_null());
 
+            let idle_frames = Rc::new(IdleFrames::new(foreground_executor.clone()));
             let state = Arc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
@@ -1073,6 +1174,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                idle_frames: idle_frames.clone(),
                 renderer,
                 request_frame_callback: None,
                 event_callback: None,
@@ -1116,7 +1218,7 @@ impl MacWindow {
                 accesskit_adapter: None,
                 sheet_parent: None,
             }));
-            let mut window = Self(state, marker);
+            let mut window = Self(state, marker, idle_frames);
 
             (*native_window)
                 .class()
@@ -2092,7 +2194,18 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
+        this.idle_frames.drew.set(true);
         this.renderer.draw(scene);
+    }
+
+    fn schedule_frame(&self) {
+        self.2.wake(&Arc::downgrade(&self.0));
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let idle_frames = self.2.clone();
+        let window_state = Arc::downgrade(&self.0);
+        Some(Rc::new(move || idle_frames.wake(&window_state)))
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3352,13 +3465,22 @@ extern "C" fn step(view: *mut c_void) {
                 (None, FrameRequestSource::NativeCallback),
                 |(at, source)| (Some(at), source),
             );
+        let idle_frames = lock.idle_frames.clone();
         drop(lock);
+        idle_frames.demanded.set(false);
+        idle_frames.drew.set(false);
         callback(RequestFrameOptions {
             signal_at,
             signal_source,
             ..Default::default()
         });
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        // Nothing drawn, presented or asked for lately: stop until GPUI wants a
+        // frame.
+        if idle_frames.frame_was_idle() {
+            lock.pause_display_link();
+        }
     }
 }
 

@@ -328,6 +328,14 @@ impl WindowFrameSource {
         Ok(())
     }
 
+    /// Asks for a frame on the main queue's next turn, without waiting for the next
+    /// vblank. Only while started.
+    pub fn request_frame_now(&self) {
+        if self.registration.is_some() {
+            self.frame_requests.merge_data(1);
+        }
+    }
+
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
         self.signal.take()
     }
