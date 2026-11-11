@@ -79,6 +79,8 @@ pub struct WindowsPlatform {
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
+    /// The DirectX devices started in `new`, until the platform first becomes windowed.
+    pending_directx_devices: RefCell<Option<PendingDirectXDevices>>,
 }
 
 struct WindowsPlatformInner {
@@ -186,6 +188,12 @@ impl Drop for PowerRequest {
 
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
+        // Start creating the DirectX devices first, so it overlaps the rest of startup.
+        let pending_directx_devices = if !headless {
+            PendingDirectXDevices::start()
+        } else {
+            None
+        };
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
@@ -301,6 +309,7 @@ impl WindowsPlatform {
             frame_scheduler: Arc::new(FrameScheduler::new()),
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
+            pending_directx_devices: RefCell::new(pending_directx_devices),
         })
     }
 
@@ -414,10 +423,13 @@ impl WindowsPlatform {
             .take()
             .unwrap_or_else(|| WindowingRequest::Windowed(GraphicalEnvironment::detect()));
         let WindowingRequest::Windowed(environment) = request else {
+            // Not kept for later: by then the device could be lost.
+            self.pending_directx_devices.borrow_mut().take();
             return;
         };
         if let Err(error) = check_can_show_windows(&environment) {
             log::info!("starting headless: {error:#}");
+            self.pending_directx_devices.borrow_mut().take();
             return;
         }
         self.attach_gpu()
@@ -426,7 +438,12 @@ impl WindowsPlatform {
 
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
-        let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        let pending = self.pending_directx_devices.borrow_mut().take();
+        let devices = match pending {
+            Some(pending) => pending.wait(),
+            None => DirectXDevices::new(),
+        }
+        .context("Creating DirectX devices")?;
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.handle_gpu_lost(&devices)?;
         }

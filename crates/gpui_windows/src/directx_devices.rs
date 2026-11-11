@@ -72,6 +72,40 @@ impl DirectXDevices {
     }
 }
 
+/// DirectX devices being created on a background thread.
+///
+/// The first `D3D11CreateDevice` in a process loads and initializes the GPU driver, which takes
+/// tens of milliseconds. Starting it when the platform is created lets that overlap the rest of
+/// startup, instead of blocking the main thread before the app's first window. D3D11 and DXGI
+/// objects aren't bound to the thread that created them.
+pub(crate) struct PendingDirectXDevices(std::thread::JoinHandle<Result<DirectXDevices>>);
+
+impl PendingDirectXDevices {
+    pub(crate) fn start() -> Option<Self> {
+        std::thread::Builder::new()
+            .name("DirectXDevices".to_owned())
+            .spawn(DirectXDevices::new)
+            .log_err()
+            .map(Self)
+    }
+
+    /// Waits for the devices. Creates them again on this thread if that failed, as a platform
+    /// without pending devices would.
+    pub(crate) fn wait(self) -> Result<DirectXDevices> {
+        match self.0.join() {
+            Ok(Ok(devices)) => Ok(devices),
+            Ok(Err(error)) => {
+                log::warn!("Creating DirectX devices in the background failed: {error:#}");
+                DirectXDevices::new()
+            }
+            Err(_) => {
+                log::warn!("Creating DirectX devices in the background panicked");
+                DirectXDevices::new()
+            }
+        }
+    }
+}
+
 #[inline]
 fn check_debug_layer_available() -> bool {
     #[cfg(debug_assertions)]
