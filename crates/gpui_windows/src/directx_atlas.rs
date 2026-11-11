@@ -2,8 +2,9 @@ use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
     Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
+        ID3D11Texture2D,
     },
     Dxgi::Common::*,
 };
@@ -14,6 +15,12 @@ use gpui::{
 };
 
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
+
+/// The size of a new atlas texture, unless a tile needs a larger one.
+const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(1024),
+    height: DevicePixels(1024),
+};
 
 struct DirectXAtlasTextures {
     device: ID3D11Device,
@@ -95,6 +102,23 @@ impl AtlasBackend for DirectXAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> anyhow::Result<AtlasTile> {
+        // A tile larger than a default texture, such as a big image, that no texture has room
+        // for gets a texture of its own, created with its pixels. Uploading them into an empty
+        // texture instead makes the driver keep a staging copy of them, as large as the image.
+        let bytes_per_pixel = bytes_per_pixel(kind);
+        if size.width > DEFAULT_ATLAS_SIZE.width || size.height > DEFAULT_ATLAS_SIZE.height {
+            let row_bytes = size.width.to_bytes(bytes_per_pixel as u8) as usize;
+            let fits_existing = self
+                .textures_mut(kind)
+                .iter_mut()
+                .any(|texture| texture.can_allocate(size));
+            if !fits_existing && bytes.len() >= row_bytes * size.height.0.max(0) as usize {
+                return self
+                    .push_texture(size, kind, Some(bytes))
+                    .and_then(|texture| texture.allocate(size))
+                    .ok_or_else(|| anyhow::anyhow!("failed to allocate"));
+            }
+        }
         let tile = self
             .allocate(size, kind)
             .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
@@ -136,62 +160,62 @@ impl DirectXAtlasTextures {
         size: Size<DevicePixels>,
         texture_kind: AtlasTextureKind,
     ) -> Option<AtlasTile> {
+        if let Some(tile) = self
+            .textures_mut(texture_kind)
+            .iter_mut()
+            .rev()
+            .find_map(|texture| texture.allocate(size))
         {
-            let textures = match texture_kind {
-                AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-                AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-                AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-            };
-
-            if let Some(tile) = textures
-                .iter_mut()
-                .rev()
-                .find_map(|texture| texture.allocate(size))
-            {
-                return Some(tile);
-            }
+            return Some(tile);
         }
 
-        let texture = self.push_texture(size, texture_kind)?;
+        let texture = self.push_texture(size, texture_kind, None)?;
         texture.allocate(size)
     }
 
+    fn textures_mut(
+        &mut self,
+        kind: AtlasTextureKind,
+    ) -> &mut AtlasTextureList<DirectXAtlasTexture> {
+        match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
+        }
+    }
+
+    /// Adds a texture with room for `min_size`. With `pixels`, the texture is exactly
+    /// `min_size` and starts with them, row after row; otherwise it is at least the default
+    /// size and starts empty.
     fn push_texture(
         &mut self,
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
+        pixels: Option<&[u8]>,
     ) -> Option<&mut DirectXAtlasTexture> {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
-        };
         // Max texture size for DirectX. See:
         // https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-resources-limits
         const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
-        let pixel_format;
-        let bind_flag;
-        let bytes_per_pixel;
-        match kind {
-            AtlasTextureKind::Monochrome => {
-                pixel_format = DXGI_FORMAT_R8_UNORM;
-                bind_flag = D3D11_BIND_SHADER_RESOURCE;
-                bytes_per_pixel = 1;
-            }
-            AtlasTextureKind::Polychrome => {
-                pixel_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                bind_flag = D3D11_BIND_SHADER_RESOURCE;
-                bytes_per_pixel = 4;
-            }
-            AtlasTextureKind::Subpixel => {
-                pixel_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                bind_flag = D3D11_BIND_SHADER_RESOURCE;
-                bytes_per_pixel = 4;
-            }
-        }
+        let size = if pixels.is_some() {
+            min_size.min(&MAX_ATLAS_SIZE)
+        } else {
+            min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE)
+        };
+        let bytes_per_pixel = bytes_per_pixel(kind);
+        let bind_flag = D3D11_BIND_SHADER_RESOURCE;
+        let pixel_format = match kind {
+            AtlasTextureKind::Monochrome => DXGI_FORMAT_R8_UNORM,
+            AtlasTextureKind::Polychrome => DXGI_FORMAT_B8G8R8A8_UNORM,
+            AtlasTextureKind::Subpixel => DXGI_FORMAT_R8G8B8A8_UNORM,
+        };
+        let initial_data = pixels.map(|pixels| D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr() as _,
+            SysMemPitch: size.width.to_bytes(bytes_per_pixel as u8),
+            SysMemSlicePitch: 0,
+        });
         let texture_desc = D3D11_TEXTURE2D_DESC {
             Width: size.width.0 as u32,
             Height: size.height.0 as u32,
@@ -211,18 +235,17 @@ impl DirectXAtlasTextures {
         unsafe {
             // This only returns None if the device is lost, which we will recreate later.
             // So it's ok to return None here.
+            // `insert` checked that `pixels` has a row of `size.width` for each of `size.height`.
             self.device
-                .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                .CreateTexture2D(
+                    &texture_desc,
+                    initial_data.as_ref().map(|data| data as *const _),
+                    Some(&mut texture),
+                )
                 .ok()?;
         }
         let texture = texture.unwrap();
 
-        let texture_list = match kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-        };
-        let index = texture_list.free_list.pop();
         let view = unsafe {
             let mut view = None;
             self.device
@@ -230,6 +253,8 @@ impl DirectXAtlasTextures {
                 .ok()?;
             [view]
         };
+        let texture_list = self.textures_mut(kind);
+        let index = texture_list.free_list.pop();
         let atlas_texture = DirectXAtlasTexture {
             id: AtlasTextureId {
                 index: index.unwrap_or(texture_list.textures.len()) as u32,
@@ -260,7 +285,19 @@ impl DirectXAtlasTextures {
     }
 }
 
+fn bytes_per_pixel(kind: AtlasTextureKind) -> u32 {
+    match kind {
+        AtlasTextureKind::Monochrome => 1,
+        AtlasTextureKind::Polychrome | AtlasTextureKind::Subpixel => 4,
+    }
+}
+
 impl DirectXAtlasTexture {
+    fn can_allocate(&self, size: Size<DevicePixels>) -> bool {
+        let mut allocator = self.allocator.clone();
+        allocator.allocate(device_size_to_etagere(size)).is_some()
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(device_size_to_etagere(size))?;
         let tile = AtlasTile {
@@ -416,5 +453,39 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    #[test]
+    fn test_large_tile_gets_a_texture_of_its_own() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let small = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        let large = Size {
+            width: DevicePixels(2400),
+            height: DevicePixels(960),
+        };
+
+        let small_tile = insert_tile(&atlas, make_image_key(1), small);
+        let large_tile = insert_tile(&atlas, make_image_key(2), large);
+        assert_ne!(large_tile.texture_id, small_tile.texture_id);
+        assert_eq!(large_tile.bounds.origin, Point::default());
+        assert_eq!(large_tile.bounds.size, large);
+
+        let lock = atlas.0.lock();
+        let texture = lock.backend.texture(large_tile.texture_id).unwrap();
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.texture.GetDesc(&mut desc) };
+        assert_eq!((desc.Width, desc.Height), (2400, 960));
+        drop(lock);
+
+        // Once it is removed, another large tile of the same size reuses its slot.
+        atlas.remove(&make_image_key(2));
+        let next_tile = insert_tile(&atlas, make_image_key(3), large);
+        assert_eq!(next_tile.bounds.size, large);
     }
 }
