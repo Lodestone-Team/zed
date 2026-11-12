@@ -16,11 +16,20 @@ use gpui::{
 
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
 
-/// The size of a new atlas texture, unless a tile needs a larger one.
+/// The size of a new atlas texture, unless a tile needs a larger one. When the textures
+/// of a kind are full, another is added. 512x512 holds a window's glyphs and icons;
+/// each kind's first texture at 1024x1024 took four times the memory, mostly empty, and
+/// some drivers (AMD's) charge about twice a texture's size to the process's committed
+/// memory.
 const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-    width: DevicePixels(1024),
-    height: DevicePixels(1024),
+    width: DevicePixels(512),
+    height: DevicePixels(512),
 };
+
+/// A tile larger than this in either dimension, which no texture has room for, gets a
+/// texture of its own, exactly its size. A few such tiles (a 480x270 image, say) leave
+/// most of a default texture unused, as nothing else fits beside them.
+const OWN_TEXTURE_ABOVE: DevicePixels = DevicePixels(256);
 
 struct DirectXAtlasTextures {
     device: ID3D11Device,
@@ -102,11 +111,11 @@ impl AtlasBackend for DirectXAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> anyhow::Result<AtlasTile> {
-        // A tile larger than a default texture, such as a big image, that no texture has room
-        // for gets a texture of its own, created with its pixels. Uploading them into an empty
-        // texture instead makes the driver keep a staging copy of them, as large as the image.
+        // A large tile, such as an image, that no texture has room for gets a texture of its
+        // own, created with its pixels. Uploading them into an empty texture instead makes the
+        // driver keep a staging copy of them, as large as the image.
         let bytes_per_pixel = bytes_per_pixel(kind);
-        if size.width > DEFAULT_ATLAS_SIZE.width || size.height > DEFAULT_ATLAS_SIZE.height {
+        if size.width > OWN_TEXTURE_ABOVE || size.height > OWN_TEXTURE_ABOVE {
             let row_bytes = size.width.to_bytes(bytes_per_pixel as u8) as usize;
             let fits_existing = self
                 .textures_mut(kind)
@@ -436,9 +445,10 @@ mod tests {
             width: DevicePixels(64),
             height: DevicePixels(64),
         };
+        // Two don't fit one default texture together.
         let big = Size {
-            width: DevicePixels(700),
-            height: DevicePixels(700),
+            width: DevicePixels(400),
+            height: DevicePixels(400),
         };
 
         let keeper_key = make_image_key(1);
@@ -487,5 +497,41 @@ mod tests {
         atlas.remove(&make_image_key(2));
         let next_tile = insert_tile(&atlas, make_image_key(3), large);
         assert_eq!(next_tile.bounds.size, large);
+    }
+
+    #[test]
+    fn test_textures_start_at_the_default_size_and_more_are_added() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let tile_size = Size {
+            width: DevicePixels(256),
+            height: DevicePixels(256),
+        };
+        let first = insert_tile(&atlas, make_image_key(1), tile_size);
+        let texture_size = |id| {
+            let lock = atlas.0.lock();
+            let texture = lock.backend.texture(id).unwrap();
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.texture.GetDesc(&mut desc) };
+            (desc.Width, desc.Height)
+        };
+        assert_eq!(texture_size(first.texture_id), (512, 512));
+        // Four fill a texture; the fifth goes into a new one of the same size.
+        let tiles: Vec<_> = (2..=5)
+            .map(|id| insert_tile(&atlas, make_image_key(id), tile_size))
+            .collect();
+        assert!(tiles[..3].iter().all(|t| t.texture_id == first.texture_id));
+        assert_ne!(tiles[3].texture_id, first.texture_id);
+        assert_eq!(texture_size(tiles[3].texture_id), (512, 512));
+
+        // A medium image that doesn't fit gets a texture of exactly its size, rather than
+        // a default one it would leave mostly empty.
+        let medium = Size {
+            width: DevicePixels(480),
+            height: DevicePixels(270),
+        };
+        let medium_tile = insert_tile(&atlas, make_image_key(6), medium);
+        assert_eq!(texture_size(medium_tile.texture_id), (480, 270));
     }
 }
